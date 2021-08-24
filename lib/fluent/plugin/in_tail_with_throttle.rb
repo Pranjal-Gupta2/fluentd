@@ -38,6 +38,7 @@ module Fluent::Plugin
     helpers :timer, :event_loop, :parser, :compat_parameters
 
     RESERVED_CHARS = ['/', '*', '%'].freeze
+    DEFAULT_GROUP = /./
 
     class WatcherSetupError < StandardError
       def initialize(msg)
@@ -117,16 +118,20 @@ module Fluent::Plugin
       config_argument :usage, :string, default: 'in_tail_parser'
     end
 
-    config_section :group_rule, param_name: :group_rules, required: false, multi: false do
+    config_section :group, required: true, multi: false do
+      desc 'Regex for extracting group\'s metadata'
+      config_param :pattern, 
+                   :regexp, 
+                   default: /var\/log\/containers\/(?<pod>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\/[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace>[^_]+)_(?<container>.+)-(?<docker_id>[a-z0-9]{64})\.log$/
+      desc 'Period of time in which the group_line_limit is applied'
+      config_param :rate_period_s, :integer, default: 60
       config_section :rule, multi: true, required: true do
-        desc 'Group key criteria (for example, \'namespace, pod_name\''
-        config_param :key, :array, default: []
-        desc 'Regular expression to extract group keys'
-        config_param :pattern, :regexp, default: /./ 
+        desc 'Namespace key'
+        config_param :namespace, :array, value_type: :string, default: [DEFAULT_GROUP]
+        desc 'Podname key'
+        config_param :pod, :array, value_type: :string, default: [DEFAULT_GROUP]
         desc 'Maximum number of log lines allowed per group over a period of rate_period_s'
         config_param :limit, :integer, default: -1
-        desc 'Period of time in which the group_line_limit is applied'
-        config_param :rate_period_s, :integer, default: 60
       end
     end
 
@@ -167,15 +172,50 @@ module Fluent::Plugin
         @exclude_path_formatters = @exclude_path.map{|path| [path, Fluent::Timezone.formatter(@path_timezone, path)]}.to_h
       end
 
-      unless @group_rules.nil?
-        ## Ensuring correct time period syntax
-        @group_rules.rule.each do |group_rule|
-          raise "rate_period_s > 0" unless group_rule.rate_period_s > 0
-        end
+      ## Ensuring correct time period syntax
+      raise "rate_period_s > 0" unless @group.rate_period_s > 0
+      @group.rule.each { |rule|
+        raise "limit >= -1" unless rule.limit >= -1
+      }
 
-        ## Sorting the group rules in decreasing order of number of keys in rules
-        @group_rules.rule.sort!{|rule_a, rule_b| rule_a.key.size <=> rule_b.key.size}.reverse!
+      ## Make sure that rules are ordered
+      ## Unordered rules can cause unexpected grouping
+      @group.rule.each { |rule| 
+        limit = rule.limit
+        num_groups = rule.namespace.size * rule.pod.size
+
+        rule.namespace.each { |namespace| 
+          namespace = /#{Regexp.quote(namespace)}/ unless namespace.eql?(DEFAULT_GROUP)
+          @group_watchers[namespace] ||= {}
+
+          rule.pod.each { |pod|
+            pod = /#{Regexp.quote(pod)}/ unless pod.eql?(DEFAULT_GROUP)
+          
+            @group_watchers[namespace][pod] = GroupWatcher.new(@group.rate_period_s, limit/num_groups)
+          }
+
+          @group_watchers[namespace][DEFAULT_GROUP] ||= GroupWatcher.new(@group.rate_period_s)
+        }
+      }
+
+      if @group_watchers.dig(DEFAULT_GROUP, DEFAULT_GROUP).nil?
+        @group_watchers[DEFAULT_GROUP] ||= {}
+        @group_watchers[DEFAULT_GROUP][DEFAULT_GROUP] = GroupWatcher.new(@group.rate_period_s)
       end
+
+      @group_watchers.each { |key, hash| 
+        next if hash[DEFAULT_GROUP].limit == -1
+        hash[DEFAULT_GROUP].limit -= hash.select{ |key, value| key != DEFAULT_GROUP}.values.reduce(0) { |sum, obj| sum + obj.limit }
+        raise "#{key}.\* limit < 0" unless hash[DEFAULT_GROUP].limit > 0
+      }
+
+      @group_watchers[DEFAULT_GROUP].each { |key, value| 
+        next if key == DEFAULT_GROUP
+        l = @group_watchers.select{ |key1, value1| key1 != DEFAULT_GROUP }
+        l = l.values.select{ |hash| hash.select{ |key1, value1| key1 == key}.size > 0 }
+        @group_watchers[DEFAULT_GROUP][key].limit -= l.reduce(0) { |sum, obj| sum + obj[key].limit}
+        raise "\*.#{key} limit < 0" unless @group_watchers[DEFAULT_GROUP][key].limit > 0
+      }
 
       # TODO: Use plugin_root_dir and storage plugin to store positions if available
       if @pos_file
@@ -268,21 +308,6 @@ module Fluent::Plugin
           end
         end
       end
-
-      unless @group_rules.nil?
-        @group_rules.rule.each{ |rule|        
-          key = Regexp.compile(rule.pattern)
-          if @group_watchers.key?(key)
-            raise "Regex pattern must be unique"
-          else 
-            @group_watchers[key] = GroupWatcher.new(rule.rate_period_s, rule.limit)
-          end
-        }
-      end
-
-      ## Adds a default group for containers for grouping unmatched logs
-      key = Regexp.compile(/./)
-      @group_watchers[key] = GroupWatcher.new unless @group_watchers.key?(key)
 
       refresh_watchers unless @skip_refresh_on_startup
       timer_execute(:in_tail_refresh_watchers, @refresh_interval, &method(:refresh_watchers))
@@ -395,6 +420,12 @@ module Fluent::Plugin
       hash
     end
 
+    def find_group(namespace, pod)
+      namespace_key = @group_watchers.keys.find { |regexp| namespace.match?(regexp) }
+      pod_key = @group_watchers[namespace_key].keys.find { |regexp| pod.match?(regexp) }
+      @group_watchers[namespace_key][pod_key]
+    end
+
     # in_tail with '*' path doesn't check rotation file equality at refresh phase.
     # So you should not use '*' path when your logs will be rotated by another tool.
     # It will cause log duplication after updated watch files.
@@ -410,22 +441,20 @@ module Fluent::Plugin
       added_hash = target_paths_hash.reject {|key, value| existence_paths_hash.key?(key)}
 
       unwatched_hash.each_value { |target_info|
-        path = target_info.path
-        group_key = @group_watchers.keys.find { |regexp| path.match(regexp) }
+        metadata = @group.pattern.match(target_info.path)
+        group_watcher = find_group(metadata['namespace'], metadata['pod'])
 
         ## Delete unwatched_path from group watchers
-        @group_watchers[group_key].current_paths.delete(path)
+        group_watcher.current_paths.delete(target_info.path)
       }
 
       added_hash.each_value { |target_info|
-        path = target_info.path
-        group_key = @group_watchers.keys.find { |regexp| path.match(regexp) }
+        metadata = @group.pattern.match(target_info.path)
+        group_watcher = find_group(metadata['namespace'], metadata['pod'])
 
         ## Add added_path to group watchers
-        @group_watchers[group_key].current_paths << path
+        group_watcher.current_paths << target_info.path
       }
-
-      puts @group_watchers.values.join("\n")
 
       stop_watchers(unwatched_hash, immediate: false, unwatched: true) unless unwatched_hash.empty?
       start_watchers(added_hash) unless added_hash.empty?
@@ -497,10 +526,9 @@ module Fluent::Plugin
 
     def start_watchers(targets_info)
       targets_info.each_value {|target_info|
-        path = target_info.path
-        group_key = @group_watchers.keys.find { |regexp| path.match(regexp) }
-        # puts "#{group_key}: #{@group_watchers[group_key]}"
-        construct_watcher(target_info, @group_watchers[group_key])
+        metadata = @group.pattern.match(target_info.path)
+        group_watcher = find_group(metadata['namespace'], metadata['pod'])
+        construct_watcher(target_info, group_watcher)
         break if before_shutdown?
       }
     end
