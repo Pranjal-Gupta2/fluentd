@@ -13,6 +13,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
+require 'pp'
 
 require 'cool.io'
 
@@ -118,20 +119,31 @@ module Fluent::Plugin
       config_argument :usage, :string, default: 'in_tail_parser'
     end
 
-    config_section :group, required: true, multi: false do
+    config_section :group_by, param_name: :group, required: true, multi: false do
+      config_argument :type, :enum, list: [:metadata, :metrics], default: :metadata
       desc 'Regex for extracting group\'s metadata'
       config_param :pattern, 
                    :regexp, 
                    default: /var\/log\/containers\/(?<pod>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\/[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace>[^_]+)_(?<container>.+)-(?<docker_id>[a-z0-9]{64})\.log$/
       desc 'Period of time in which the group_line_limit is applied'
       config_param :rate_period_s, :integer, default: 60
-      config_section :rule, multi: true, required: true do
+
+      config_section :metadata_rule, multi: true, required: false do
         desc 'Namespace key'
         config_param :namespace, :array, value_type: :string, default: [DEFAULT_GROUP]
         desc 'Podname key'
         config_param :pod, :array, value_type: :string, default: [DEFAULT_GROUP]
         desc 'Maximum number of log lines allowed per group over a period of rate_period_s'
         config_param :limit, :integer, default: -1
+      end
+
+      config_section :metric_rule, multi: true, required: false do
+        desc "Metric used for Grouping"
+        config_param :metric, :enum, list: [:TopN], default: :TopN
+        desc "Parameter used by metric (if any)"
+        config_param :param, :integer, default: 5
+        desc 'Maximum number of log lines allowed per group over a period of rate_period_s'
+        config_param :limit, :integer, default: -1        
       end
     end
 
@@ -174,48 +186,72 @@ module Fluent::Plugin
 
       ## Ensuring correct time period syntax
       raise "rate_period_s > 0" unless @group.rate_period_s > 0
-      @group.rule.each { |rule|
-        raise "limit >= -1" unless rule.limit >= -1
-      }
+      if @group.metric_rule.nil?
+        @group.metric_rule.each { |rule|
+          raise "limit >= -1" unless rule.limit >= -1
+        }
+      end
+      if @group.metadata_rule.nil?
+        @group.metadata_rule.each { |rule| 
+          raise "limit >= -1" unless rule.limit >= -1
+        }
+      end
 
       ## Make sure that rules are ordered
       ## Unordered rules can cause unexpected grouping
-      @group.rule.each { |rule| 
-        limit = rule.limit
-        num_groups = rule.namespace.size * rule.pod.size
+      pp @group
 
-        rule.namespace.each { |namespace| 
-          namespace = /#{Regexp.quote(namespace)}/ unless namespace.eql?(DEFAULT_GROUP)
-          @group_watchers[namespace] ||= {}
-
-          rule.pod.each { |pod|
-            pod = /#{Regexp.quote(pod)}/ unless pod.eql?(DEFAULT_GROUP)
+      case @group.type
+      when :metadata
+        @group.metadata_rule.each { |rule|
+          num_groups = rule.namespace.size * rule.pod.size
           
-            @group_watchers[namespace][pod] = GroupWatcher.new(@group.rate_period_s, limit/num_groups)
+          rule.namespace.each { |namespace| 
+            namespace = /#{Regexp.quote(namespace)}/ unless namespace.eql?(DEFAULT_GROUP)
+            @group_watchers[namespace] ||= {}
+  
+            rule.pod.each { |pod|
+              pod = /#{Regexp.quote(pod)}/ unless pod.eql?(DEFAULT_GROUP)
+            
+              @group_watchers[namespace][pod] = GroupWatcher.new(@group.rate_period_s, rule.limit/num_groups)
+            }
+  
+            @group_watchers[namespace][DEFAULT_GROUP] ||= GroupWatcher.new(@group.rate_period_s)
           }
-
-          @group_watchers[namespace][DEFAULT_GROUP] ||= GroupWatcher.new(@group.rate_period_s)
         }
-      }
 
-      if @group_watchers.dig(DEFAULT_GROUP, DEFAULT_GROUP).nil?
-        @group_watchers[DEFAULT_GROUP] ||= {}
-        @group_watchers[DEFAULT_GROUP][DEFAULT_GROUP] = GroupWatcher.new(@group.rate_period_s)
+        if @group_watchers.dig(DEFAULT_GROUP, DEFAULT_GROUP).nil?
+          @group_watchers[DEFAULT_GROUP] ||= {}
+          @group_watchers[DEFAULT_GROUP][DEFAULT_GROUP] = GroupWatcher.new(@group.rate_period_s)
+        end
+  
+        @group_watchers.each { |key, hash| 
+          next if hash[DEFAULT_GROUP].limit == -1
+          hash[DEFAULT_GROUP].limit -= hash.select{ |key, value| key != DEFAULT_GROUP}.values.reduce(0) { |sum, obj| sum + obj.limit }
+          raise "#{key}.\* limit < 0" unless hash[DEFAULT_GROUP].limit > 0
+        }
+  
+        @group_watchers[DEFAULT_GROUP].each { |key, value| 
+          next if key == DEFAULT_GROUP
+          l = @group_watchers.select{ |key1, value1| key1 != DEFAULT_GROUP }
+          l = l.values.select{ |hash| hash.select{ |key1, value1| key1 == key}.size > 0 }
+          @group_watchers[DEFAULT_GROUP][key].limit -= l.reduce(0) { |sum, obj| sum + obj[key].limit}
+          raise "\*.#{key} limit < 0" unless @group_watchers[DEFAULT_GROUP][key].limit > 0
+        }
+
+      when :metrics
+        @group.metric_rule.each { |rule| 
+          case rule.metric
+          when :TopN
+            @group_watchers[:TopN] = TopNGroupWatcher.new(@group.rate_period_s, rule.limit, rule.param)
+            @group_watchers[DEFAULT_GROUP] = TopNGroupWatcher.new
+          else
+            raise "Group Metric Type: #{rule.metric} not found"
+          end
+        }
       end
 
-      @group_watchers.each { |key, hash| 
-        next if hash[DEFAULT_GROUP].limit == -1
-        hash[DEFAULT_GROUP].limit -= hash.select{ |key, value| key != DEFAULT_GROUP}.values.reduce(0) { |sum, obj| sum + obj.limit }
-        raise "#{key}.\* limit < 0" unless hash[DEFAULT_GROUP].limit > 0
-      }
-
-      @group_watchers[DEFAULT_GROUP].each { |key, value| 
-        next if key == DEFAULT_GROUP
-        l = @group_watchers.select{ |key1, value1| key1 != DEFAULT_GROUP }
-        l = l.values.select{ |hash| hash.select{ |key1, value1| key1 == key}.size > 0 }
-        @group_watchers[DEFAULT_GROUP][key].limit -= l.reduce(0) { |sum, obj| sum + obj[key].limit}
-        raise "\*.#{key} limit < 0" unless @group_watchers[DEFAULT_GROUP][key].limit > 0
-      }
+      pp @group_watchers
 
       # TODO: Use plugin_root_dir and storage plugin to store positions if available
       if @pos_file
@@ -440,24 +476,79 @@ module Fluent::Plugin
       unwatched_hash = existence_paths_hash.reject {|key, value| target_paths_hash.key?(key)}
       added_hash = target_paths_hash.reject {|key, value| existence_paths_hash.key?(key)}
 
-      unwatched_hash.each_value { |target_info|
-        metadata = @group.pattern.match(target_info.path)
-        group_watcher = find_group(metadata['namespace'], metadata['pod'])
+      case @group.type
+      when :metadata
+        unwatched_hash.each_value { |target_info|
+          metadata = @group.pattern.match(target_info.path)
+          group_watcher = metadata.nil? ? find_group(DEFAULT_GROUP, DEFAULT_GROUP) : find_group(metadata['namespace'], metadata['pod'])
 
-        ## Delete unwatched_path from group watchers
-        group_watcher.current_paths.delete(target_info.path)
-      }
+  
+          ## Delete unwatched_path from group watchers
+          group_watcher.current_paths.delete(target_info.path)
+        }
+  
+        added_hash.each_value { |target_info|
+          metadata = @group.pattern.match(target_info.path)
+          group_watcher = metadata.nil? ? find_group(DEFAULT_GROUP, DEFAULT_GROUP) : find_group(metadata['namespace'], metadata['pod'])
+  
+          ## Add added_path to group watchers
+          group_watcher.current_paths << target_info.path
+        }
 
-      added_hash.each_value { |target_info|
-        metadata = @group.pattern.match(target_info.path)
-        group_watcher = find_group(metadata['namespace'], metadata['pod'])
+      when :metrics
+        puts "In Metrics Refresh Watcher"
+        ## Get TopN Files
+        ## TopN Existence files - TOPN Group
+        ## Added + remaining files - Default Group
+        ## Also update previous TailWatcher's GroupWatcher object
+        sorted_path = sort_files_by_log_generation_rate
 
-        ## Add added_path to group watchers
-        group_watcher.current_paths << target_info.path
-      }
+        group_watcher = @group_watchers[:TopN]
+        group_watcher.current_paths = []
+
+        n = group_watcher.num_container
+
+        sorted_path.first(n).each { |_, tw| 
+          tw.group_watcher = group_watcher
+          group_watcher.current_paths << tw.path
+        }
+
+        group_watcher = @group_watchers[DEFAULT_GROUP]
+        group_watcher.current_paths = []
+  
+        sorted_path.last(sorted_path.size - n).each { |_, tw| 
+          tw.group_watcher = group_watcher
+          group_watcher.current_paths << tw.path
+        } unless sorted_path.size - n < 0
+      end
+
+      pp @group_watchers
 
       stop_watchers(unwatched_hash, immediate: false, unwatched: true) unless unwatched_hash.empty?
       start_watchers(added_hash) unless added_hash.empty?
+    end
+
+    def sort_files_by_log_generation_rate
+      paths_with_log_collected_info = []
+
+      @tails.each_value { |tw|
+        pe = tw.pe
+
+        old_pos = pe.instance_variable_get(:@_old_pos) || 0.0
+        pe.instance_variable_set(:@_old_pos, pe.read_pos)
+        old_inode = pe.instance_variable_get(:@_old_inode)
+        pe.instance_variable_set(:@_old_inode, pe.read_inode)
+
+        if pe.read_inode == old_inode && pe.read_pos >= old_pos
+          paths_with_log_collected_info << [pe.read_pos - old_pos, tw]
+        else
+          paths_with_log_collected_info << [pe.read_pos, tw]
+        end
+      }
+
+      paths_with_log_collected_info.sort! { |list_a, list_b| -list_a[0] <=> -list_b[0] }
+      paths_with_log_collected_info 
+
     end
 
     def setup_watcher(target_info, pe, group_watcher)
@@ -526,8 +617,15 @@ module Fluent::Plugin
 
     def start_watchers(targets_info)
       targets_info.each_value {|target_info|
-        metadata = @group.pattern.match(target_info.path)
-        group_watcher = find_group(metadata['namespace'], metadata['pod'])
+        case @group.type
+        when :metadata
+          metadata = @group.pattern.match(target_info.path)
+          group_watcher = metadata.nil? ? find_group(DEFAULT_GROUP, DEFAULT_GROUP) : find_group(metadata['namespace'], metadata['pod'])
+
+        when :metrics
+          group_watcher = @group_watchers[DEFAULT_GROUP] 
+        end
+
         construct_watcher(target_info, group_watcher)
         break if before_shutdown?
       }
@@ -787,6 +885,7 @@ module Fluent::Plugin
       end
 
       def limit_lines_reached?
+        return true if @limit == 0
         return false if @limit < 0
         return false if @number_lines_read < @limit/@current_paths.size
 
@@ -807,6 +906,18 @@ module Fluent::Plugin
 
       def to_s
         super + " current_paths: #{@current_paths} rate_period_s: #{@rate_period_s} limit: #{@limit}"
+      end
+    end
+
+    class TopNGroupWatcher < GroupWatcher
+      attr_accessor :num_container
+      def initialize(rate_period_s = 60, limit = 0, num_container = -1)
+        super(rate_period_s, limit)
+        @num_container = num_container
+      end
+
+      def to_s
+        super + " num_container: #{num_container}"
       end
     end
 
@@ -863,6 +974,7 @@ module Fluent::Plugin
       attr_reader :line_buffer_timer_flusher
       attr_accessor :unwatched  # This is used for removing position entry from PositionFile
       attr_reader :watchers
+      attr_accessor :group_watcher
 
       def tag
         @parsed_tag ||= @path.tr('/', '.').gsub(/\.+/, '.').gsub(/^\./, '')
