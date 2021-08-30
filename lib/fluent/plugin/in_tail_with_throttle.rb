@@ -186,14 +186,14 @@ module Fluent::Plugin
 
       ## Ensuring correct time period syntax
       raise "rate_period_s > 0" unless @group.rate_period_s > 0
-      if @group.metric_rule.nil?
+      unless @group.metric_rule.nil?
         @group.metric_rule.each { |rule|
-          raise "limit >= -1" unless rule.limit >= -1
+          raise "Metric Group Limit >= -1" unless rule.limit >= -1
         }
       end
-      if @group.metadata_rule.nil?
+      unless @group.metadata_rule.nil?
         @group.metadata_rule.each { |rule| 
-          raise "limit >= -1" unless rule.limit >= -1
+          raise "Metadata Group Limit >= -1" unless rule.limit >= -1
         }
       end
 
@@ -456,10 +456,26 @@ module Fluent::Plugin
       hash
     end
 
-    def find_group(namespace, pod)
-      namespace_key = @group_watchers.keys.find { |regexp| namespace.match?(regexp) }
-      pod_key = @group_watchers[namespace_key].keys.find { |regexp| pod.match?(regexp) }
-      @group_watchers[namespace_key][pod_key]
+    def find_group_from_metadata(path)
+      def find_group(namespace, pod)
+        namespace_key = @group_watchers.keys.find { |regexp| namespace.match?(regexp) && regexp != DEFAULT_GROUP }
+        namespace_key ||= DEFAULT_GROUP
+
+        pod_key = @group_watchers[namespace_key].keys.find { |regexp| pod.match?(regexp) && regexp != DEFAULT_GROUP }
+        pod_key ||= DEFAULT_GROUP
+
+        @group_watchers[namespace_key][pod_key]
+      end
+  
+      begin
+        metadata = @group.pattern.match(path)
+        group_watcher = find_group(metadata['namespace'], metadata['pod'])
+      rescue => e
+        $log.warn "Cannot find group from metadata, Adding file in the default group"
+        group_watcher = @group_watchers[DEFAULT_GROUP][DEFAULT_GROUP] 
+      end
+
+      group_watcher
     end
 
     # in_tail with '*' path doesn't check rotation file equality at refresh phase.
@@ -479,19 +495,12 @@ module Fluent::Plugin
       case @group.type
       when :metadata
         unwatched_hash.each_value { |target_info|
-          metadata = @group.pattern.match(target_info.path)
-          group_watcher = metadata.nil? ? find_group(DEFAULT_GROUP, DEFAULT_GROUP) : find_group(metadata['namespace'], metadata['pod'])
-
-  
-          ## Delete unwatched_path from group watchers
+          group_watcher = find_group_from_metadata(target_info.path)
           group_watcher.current_paths.delete(target_info.path)
         }
   
         added_hash.each_value { |target_info|
-          metadata = @group.pattern.match(target_info.path)
-          group_watcher = metadata.nil? ? find_group(DEFAULT_GROUP, DEFAULT_GROUP) : find_group(metadata['namespace'], metadata['pod'])
-  
-          ## Add added_path to group watchers
+          group_watcher = find_group_from_metadata(target_info.path)
           group_watcher.current_paths << target_info.path
         }
 
@@ -619,9 +628,7 @@ module Fluent::Plugin
       targets_info.each_value {|target_info|
         case @group.type
         when :metadata
-          metadata = @group.pattern.match(target_info.path)
-          group_watcher = metadata.nil? ? find_group(DEFAULT_GROUP, DEFAULT_GROUP) : find_group(metadata['namespace'], metadata['pod'])
-
+          group_watcher = find_group_from_metadata(target_info.path)
         when :metrics
           group_watcher = @group_watchers[DEFAULT_GROUP] 
         end
