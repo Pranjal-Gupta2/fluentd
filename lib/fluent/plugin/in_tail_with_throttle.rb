@@ -199,8 +199,6 @@ module Fluent::Plugin
 
       ## Make sure that rules are ordered
       ## Unordered rules can cause unexpected grouping
-      pp @group
-
       case @group.type
       when :metadata
         @group.metadata_rule.each { |rule|
@@ -250,8 +248,6 @@ module Fluent::Plugin
           end
         }
       end
-
-      pp @group_watchers
 
       # TODO: Use plugin_root_dir and storage plugin to store positions if available
       if @pos_file
@@ -505,7 +501,6 @@ module Fluent::Plugin
         }
 
       when :metrics
-        puts "In Metrics Refresh Watcher"
         ## Get TopN Files
         ## TopN Existence files - TOPN Group
         ## Added + remaining files - Default Group
@@ -541,17 +536,24 @@ module Fluent::Plugin
       paths_with_log_collected_info = []
 
       @tails.each_value { |tw|
-        pe = tw.pe
+        begin
+          stat = Fluent::FileWrapper.stat(tw.path)
+        rescue Errno::ENOENT, Errno::EACCES
+          # moved or deleted
+          stat = nil
+        end 
 
-        old_pos = pe.instance_variable_get(:@_old_pos) || 0.0
-        pe.instance_variable_set(:@_old_pos, pe.read_pos)
-        old_inode = pe.instance_variable_get(:@_old_inode)
-        pe.instance_variable_set(:@_old_inode, pe.read_inode)
+        old_pos = tw.instance_variable_get(:@_old_pos) || 0.0
+        old_inode = tw.instance_variable_get(:@_old_inode)
+        if !stat.nil?
+          tw.instance_variable_set(:@_old_pos, stat.size)
+          tw.instance_variable_set(:@_old_inode, stat.ino)
 
-        if pe.read_inode == old_inode && pe.read_pos >= old_pos
-          paths_with_log_collected_info << [pe.read_pos - old_pos, tw]
-        else
-          paths_with_log_collected_info << [pe.read_pos, tw]
+          if stat.ino == old_inode && stat.size >= old_pos
+            paths_with_log_collected_info << [(stat.size - old_pos)/@refresh_interval, tw]
+          else
+            paths_with_log_collected_info << [stat.size/@refresh_interval, tw]
+          end
         end
       }
 
@@ -901,7 +903,6 @@ module Fluent::Plugin
 
         if time_spent_reading < @rate_period_s
           # Exceeds limit
-          puts "Group Rate exceeded : #{@number_lines_read} Group: #{@current_paths.size}"
           true
         else
           # Does not exceed limit
@@ -973,7 +974,6 @@ module Fluent::Plugin
         @io_handler_build = io_handler_build
         @watchers = []
         @group_watcher = group_watcher
-        # puts "Inside TailWatcher #{@group_watcher}"
       end
 
       attr_reader :path, :ino
@@ -1198,11 +1198,11 @@ module Fluent::Plugin
           @shutdown_timeout = SHUTDOWN_TIMEOUT
           @shutdown_mutex = Mutex.new
           @eof = false
-          @group_watcher = group_watcher
-
-          # puts "Inside IOHandler #{@group_watcher}"
-
           @log.info "following tail of #{@path}"
+        end
+
+        def group_watcher
+          @watcher.group_watcher
         end
 
         def on_notify
@@ -1241,7 +1241,7 @@ module Fluent::Plugin
         end
 
         def handle_notify
-          return if @group_watcher.limit_lines_reached?
+          return if group_watcher.limit_lines_reached?
           with_io do |io|
             begin
               read_more = false
@@ -1249,15 +1249,15 @@ module Fluent::Plugin
               if !io.nil? && @lines.empty?
                 begin
                   while true
-                    @group_watcher.start_reading_time ||= Fluent::Clock.now
+                    group_watcher.start_reading_time ||= Fluent::Clock.now
                     data = io.readpartial(BYTES_TO_READ, @iobuf)
                     @eof = false
                     @fifo << data
-                    @group_watcher.number_lines_read -= @lines.size
+                    group_watcher.number_lines_read -= @lines.size
                     @fifo.read_lines(@lines)
-                    @group_watcher.number_lines_read += @lines.size
+                    group_watcher.number_lines_read += @lines.size
 
-                    if @group_watcher.limit_lines_reached? || should_shutdown_now?
+                    if group_watcher.limit_lines_reached? || should_shutdown_now?
                       # Just get out from tailing loop.
                       read_more = false
                       break
@@ -1271,12 +1271,12 @@ module Fluent::Plugin
                   @eof = true
                 end
               end
-              puts "Reading for #{@watcher.path} #{@eof} #{@group_watcher.number_lines_read} #{Fluent::Clock.now - @group_watcher.start_reading_time}"
+              # puts "Reading for #{@watcher.path} #{@eof} #{group_watcher.number_lines_read} #{Fluent::Clock.now - group_watcher.start_reading_time}"
 
               if !read_more
                 # reset counter for files in same group
-                @group_watcher.start_reading_time = nil
-                @group_watcher.number_lines_read = 0
+                group_watcher.start_reading_time = nil
+                group_watcher.number_lines_read = 0
               end
 
               unless @lines.empty?
