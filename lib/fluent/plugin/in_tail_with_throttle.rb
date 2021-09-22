@@ -226,15 +226,15 @@ module Fluent::Plugin
         @group_watchers.each { |key, hash| 
           next if hash[DEFAULT_GROUP].limit == -1
           hash[DEFAULT_GROUP].limit -= hash.select{ |key, value| key != DEFAULT_GROUP}.values.reduce(0) { |sum, obj| sum + obj.limit }
-          raise "#{key}.\* limit < 0" unless hash[DEFAULT_GROUP].limit > 0
+          raise "#{key}.\* limit < 0" unless hash[DEFAULT_GROUP].limit >= 0
         }
   
         @group_watchers[DEFAULT_GROUP].each { |key, value| 
-          next if key == DEFAULT_GROUP
+          next if key == DEFAULT_GROUP || value.limit == -1
           l = @group_watchers.select{ |key1, value1| key1 != DEFAULT_GROUP }
           l = l.values.select{ |hash| hash.select{ |key1, value1| key1 == key}.size > 0 }
           @group_watchers[DEFAULT_GROUP][key].limit -= l.reduce(0) { |sum, obj| sum + obj[key].limit}
-          raise "\*.#{key} limit < 0" unless @group_watchers[DEFAULT_GROUP][key].limit > 0
+          raise "\*.#{key} limit < 0" unless @group_watchers[DEFAULT_GROUP][key].limit >= 0
         }
 
       when :metrics
@@ -396,6 +396,7 @@ module Fluent::Plugin
                 if is_file
                   unless @ignore_list.include?(p)
                     log.warn "#{p} unreadable. It is excluded and would be examined next time."
+                    # pp "File not readable #{p} #{@tails.keys}"
                     @ignore_list << p if @ignore_repeated_permission_error
                   end
                 end
@@ -488,6 +489,9 @@ module Fluent::Plugin
       unwatched_hash = existence_paths_hash.reject {|key, value| target_paths_hash.key?(key)}
       added_hash = target_paths_hash.reject {|key, value| existence_paths_hash.key?(key)}
 
+      stop_watchers(unwatched_hash, immediate: false, unwatched: true) unless unwatched_hash.empty?
+      @log.debug "STOP WATCHERS CALLED #{unwatched_hash.values}" unless unwatched_hash.empty?
+
       case @group.type
       when :metadata
         unwatched_hash.each_value { |target_info|
@@ -525,11 +529,8 @@ module Fluent::Plugin
           group_watcher.current_paths << tw.path
         } unless sorted_path.size - n < 0
       end
-
-      pp @group_watchers
-
-      stop_watchers(unwatched_hash, immediate: false, unwatched: true) unless unwatched_hash.empty?
       start_watchers(added_hash) unless added_hash.empty?
+      @log.debug "START WATCHERS CALLED #{added_hash.values}" unless added_hash.empty?
     end
 
     def sort_files_by_log_generation_rate
@@ -554,6 +555,8 @@ module Fluent::Plugin
           else
             paths_with_log_collected_info << [stat.size/@refresh_interval, tw]
           end
+        else 
+          @log.debug "Stat Object nil for #{tw.path}"
         end
       }
 
@@ -563,8 +566,11 @@ module Fluent::Plugin
     end
 
     def setup_watcher(target_info, pe, group_watcher)
+      @log.debug "Setup_watcher called #{target_info.path} #{target_info.ino}"
       line_buffer_timer_flusher = @multiline_mode ? TailWatcher::LineBufferTimerFlusher.new(log, @multiline_flush_interval, &method(:flush_buffer)) : nil
       tw = TailWatcher.new(target_info, pe, log, @read_from_head, @follow_inodes, method(:update_watcher), line_buffer_timer_flusher, group_watcher, method(:io_handler))
+
+      group_watcher.current_paths << tw.path unless group_watcher.current_paths.include? tw.path
 
       if @enable_watch_timer
         tt = TimerTrigger.new(1, log) { tw.on_notify }
@@ -652,6 +658,7 @@ module Fluent::Plugin
           if immediate
             detach_watcher(tw, target_info.ino, false)
           else
+            @log.debug "Detach Watcher after rotate wait called from stop watchers #{target_info.path} #{target_info.ino}"
             detach_watcher_after_rotate_wait(tw, target_info.ino)
           end
         end
@@ -675,8 +682,9 @@ module Fluent::Plugin
         pe_inode = pe.read_inode
         target_info_from_position_entry = TargetInfo.new(target_info.path, pe_inode)
         unless pe_inode == @pf[target_info_from_position_entry].read_inode
-          log.debug "Skip update_watcher because watcher has been already updated by other inotify event"
-          return
+          @log.debug "PE INODE #{pe_inode} #{@pf[target_info_from_position_entry].read_inode}" 
+          log.debug "Skip update_watcher for #{target_info.path} because watcher has been already updated by other inotify event"
+          # return
         end
       end
 
@@ -699,9 +707,12 @@ module Fluent::Plugin
       else
         # Make sure to delete old key, it has a different ino while the hash key is same.
         @tails.delete(rotated_target_info)
+        @log.debug "Calling setup_watcher #{rotated_target_info.path} #{rotated_target_info.ino}"
         @tails[new_target_info] = setup_watcher(new_target_info, pe, group_watcher)
+        @log.debug "Calling tw on_notify on #{new_target_info.path} #{new_target_info.ino}"
         @tails[new_target_info].on_notify
       end
+      @log.debug "Detach watcher after rotate wait #{rotated_target_info.path} #{rotated_target_info.ino}"
       detach_watcher_after_rotate_wait(rotated_tw, pe.read_inode) if rotated_tw
     end
 
@@ -716,6 +727,7 @@ module Fluent::Plugin
       tw.detach(@shutdown_start_time)
 
       tw.close if close_io
+      @log.debug "TW Closed #{tw.path} #{ino}"
 
       if tw.unwatched && @pf
         target_info = TargetInfo.new(tw.path, ino)
@@ -732,6 +744,7 @@ module Fluent::Plugin
       elsif @read_bytes_limit_per_second < 0
         # throttling isn't enabled, just wait @rotate_wait
         timer_execute(:in_tail_close_watcher, @rotate_wait, repeat: false) do
+          @log.debug "Detach Watcher actually called #{tw.path} #{ino}"
           detach_watcher(tw, ino)
         end
       else
@@ -937,6 +950,7 @@ module Fluent::Plugin
       end
 
       def on_change(prev, cur)
+        @log.debug "StatWatcher called for #{@path}"
         @callback.call
       rescue
         @log.error $!.to_s
@@ -994,6 +1008,7 @@ module Fluent::Plugin
       def detach(shutdown_start_time = nil)
         if @io_handler
           @io_handler.ready_to_shutdown(shutdown_start_time)
+          @log.debug "Calling io_handler's on_notify in TW Detach #{@path} #{@ino}"
           @io_handler.on_notify
         end
         @line_buffer_timer_flusher&.close(self)
@@ -1015,6 +1030,7 @@ module Fluent::Plugin
           stat = Fluent::FileWrapper.stat(@path)
         rescue Errno::ENOENT, Errno::EACCES
           # moved or deleted
+          @log.debug "Tailwatcher stat is nil. File moved or deleted #{@path} #{@ino}"
           stat = nil
         end
 
@@ -1025,6 +1041,7 @@ module Fluent::Plugin
 
       def on_rotate(stat)
         if @io_handler.nil?
+          @log.debug "IO Handler is NIL #{@path} #{@ino}"
           if stat
             # first time
             fsize = stat.size
@@ -1053,6 +1070,7 @@ module Fluent::Plugin
               pos = @read_from_head ? 0 : fsize
               @pe.update(inode, pos)
             end
+            @log.debug "Creating IO Handler for the first time - #{@path} #{@ino}"
             @io_handler = io_handler
           else
             @io_handler = NullIOHandler.new
@@ -1061,6 +1079,7 @@ module Fluent::Plugin
           watcher_needs_update = false
 
           if stat
+            @log.debug "Stat is NOT nil. #{@path} #{@ino}"
             inode = stat.ino
             if inode == @pe.read_inode # truncated
               @pe.update_pos(0)
@@ -1074,6 +1093,7 @@ module Fluent::Plugin
             end
           else # file is rotated and new file not found
             # Clear RotateHandler to avoid duplicated file watch in same path.
+            @log.debug "File is rotated and new file not found - Watcher_needs_update #{@path} #{@ino}"
             @rotate_handler = nil
             watcher_needs_update = true
           end
@@ -1093,6 +1113,7 @@ module Fluent::Plugin
               # calling `#refresh_watchers`s, and `#refresh_watchers` won't run `#start_watchers`
               # and `#stop_watchers()` for the path because `target_paths_hash`
               # always contains the path.
+              @log.debug "Calling update_watcher for #{@path} #{@ino}"
               target_info = TargetInfo.new(@path, stat ? stat.ino : nil)
               @update_watcher.call(target_info, swap_state(@pe), @group_watcher)
             end
@@ -1241,7 +1262,10 @@ module Fluent::Plugin
         end
 
         def handle_notify
+          @log.debug "In Handle Notify #{@path} #{@ino} #{@watcher.ino}"
           return if group_watcher.limit_lines_reached?
+          @log.debug "First return statement passed #{@path} #{@ino} #{group_watcher.number_lines_read}"
+
           with_io do |io|
             begin
               read_more = false
@@ -1271,7 +1295,7 @@ module Fluent::Plugin
                   @eof = true
                 end
               end
-              # puts "Reading for #{@watcher.path} #{@eof} #{group_watcher.number_lines_read} #{Fluent::Clock.now - group_watcher.start_reading_time}"
+              @log.debug "Reading: #{@watcher.path} #{@watcher.ino} EOF: #{@eof} Lines: #{group_watcher.number_lines_read}"
 
               if !read_more
                 # reset counter for files in same group
@@ -1299,7 +1323,7 @@ module Fluent::Plugin
           io.close if io
           raise WatcherSetupError, "seek error with #{@path}: file position = #{@watcher.pe.read_pos.to_s(16)}, reading bytesize = #{@fifo.bytesize.to_s(16)}"
         rescue Errno::EACCES => e
-          @log.warn "#{e}"
+          @log.warn "#{e} #{@path}"
           nil
         rescue Errno::ENOENT
           nil
@@ -1315,8 +1339,10 @@ module Fluent::Plugin
             end
           else
             @io ||= open
+            @log.debug "@io : #{@io} #{@watcher.path} #{@watcher.ino}"
             yield @io
             @eof = true if @io.nil?
+            @log.debug "IO NIL ! Because eof is #{@eof}" if @io.nil?
           end
         rescue WatcherSetupError => e
           close
@@ -1332,6 +1358,7 @@ module Fluent::Plugin
 
       class NullIOHandler
         def initialize
+          $log.warn "NullIOHandler Initialize called"
         end
 
         def io
