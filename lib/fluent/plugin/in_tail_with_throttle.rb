@@ -13,7 +13,6 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 #
-require 'pp'
 require 'fluent/plugin/input'
 require 'fluent/config/error'
 require 'fluent/plugin/in_tail'
@@ -280,6 +279,7 @@ module Fluent::Plugin
       end
     end
 
+
     class TopNGroupWatcher < GroupWatcher
       attr_accessor :num_container
       def initialize(rate_period_s = 60, limit = 0, num_container = -1)
@@ -292,13 +292,8 @@ module Fluent::Plugin
       end
     end
 
-    class ThrottleTailWatcher < Fluent::Plugin::TailInput::TailWatcher
 
-      def initialize(target_info, pe, log, read_from_head, follow_inodes, update_watcher, line_buffer_timer_flusher, io_handler_build, metrics)
-        super
-        @group_watcher = nil
-      end
-
+    class Fluent::Plugin::TailInput::TailWatcher
       attr_accessor :group_watcher
 
       def group_watcher=(group_watcher)
@@ -306,17 +301,14 @@ module Fluent::Plugin
       end
 
 
-      class ThrottleIOHandler < Fluent::Plugin::TailInput::TailWatcher::IOHandler
-
-        def initialize(watcher, path:, read_lines_limit:, read_bytes_limit_per_second:, log:, open_on_every_update:, from_encoding: nil, encoding: nil, metrics:, &receive_lines)
-          super
-        end
+      class Fluent::Plugin::TailInput::TailWatcher::IOHandler
+        alias_method :orig_handle_notify, :handle_notify
 
         def group_watcher
           @watcher.group_watcher
         end
 
-        def handle_notify
+        def rate_limit_handle_notify
           return if group_watcher.limit_lines_reached?
 
           with_io do |io|
@@ -367,11 +359,15 @@ module Fluent::Plugin
             end while read_more
           end
         end
-      
-      end
-      
-      TailInput::TailWatcher::IOHandler = ThrottleIOHandler
+
+        def handle_notify
+          if @watcher.group_watcher.nil?
+            orig_handle_notify
+          else
+            rate_limit_handle_notify
+          end
+        end
+      end      
     end
-    TailInput::TailWatcher = ThrottleTailWatcher
   end
 end
