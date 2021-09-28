@@ -22,6 +22,8 @@ module Fluent::Plugin
     DEFAULT_NAMESPACE = DEFAULT_POD = /./
     DEFAULT_LIMIT = -1
 
+    attr_reader :group_watchers
+
     def initialize
       super
       # Map rules with GroupWatcher objects
@@ -37,7 +39,7 @@ module Fluent::Plugin
       desc 'Period of time in which the group_line_limit is applied'
       config_param :rate_period, :time, default: 5
 
-      config_section :rule, multi: true, required: false do
+      config_section :rule, multi: true, required: true do
         desc 'Namespace key'
         config_param :namespace, :array, value_type: :string, default: [DEFAULT_NAMESPACE]
         desc 'Podname key'
@@ -50,7 +52,6 @@ module Fluent::Plugin
     def configure(conf)
       super
       ## Ensuring correct time period syntax
-      raise "rate_period > 0" unless @group.rate_period > 0
       @group.rule.each { |rule| 
         raise "Metadata Group Limit >= DEFAULT_LIMIT" unless rule.limit >= DEFAULT_LIMIT
       }
@@ -161,6 +162,10 @@ module Fluent::Plugin
         @current_paths.key?(path)
       end
 
+      def size
+        @current_paths.size
+      end
+
       def delete(path)
         @current_paths.delete(path)
       end
@@ -191,7 +196,7 @@ module Fluent::Plugin
         return false if @limit < 0
 
         if include?(path)
-          return false if @current_paths[path].number_lines_read < @limit / @current_paths.size
+          return false if @current_paths[path].number_lines_read * size < @limit
         else
           ## path has been deleted from the group
           return true
