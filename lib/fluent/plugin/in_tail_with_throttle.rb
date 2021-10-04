@@ -81,10 +81,10 @@ module Fluent::Plugin
         @group_watchers[DEFAULT_NAMESPACE][DEFAULT_POD] = GroupWatcher.new(@group.rate_period)
       end
 
-      @group_watchers.each { |namespace, podHash| 
+      @group_watchers.each { |_, podHash| 
         next if podHash[DEFAULT_POD].limit == DEFAULT_LIMIT
-        podHash[DEFAULT_POD].limit -= podHash.select{ |namespace, _| namespace != DEFAULT_NAMESPACE}.values.reduce(0) { |sum, obj| sum + obj.limit }
-        raise "Group line limit resolution failed for Namespace: #{namespace} & Pod: DEFAULT_POD" unless podHash[DEFAULT_POD].limit >= 0
+        podHash[DEFAULT_POD].limit -= podHash.select{ |pod, _| pod != DEFAULT_POD}.values.reduce(0) { |sum, obj| sum + obj.limit }
+        raise "Group line limit resolution failed" unless podHash[DEFAULT_POD].limit >= 0
       }
 
       tmp = @group_watchers.select{ |namespace, _| namespace != DEFAULT_NAMESPACE }
@@ -94,7 +94,7 @@ module Fluent::Plugin
         l = tmp.values.select{ |podHash| podHash.select{ |pod, _| pod == podname }.size > 0 }
 
         @group_watchers[DEFAULT_NAMESPACE][podname].limit -= l.reduce(0) { |sum, obj| sum + obj[podname].limit}
-        raise "Group line limit resolution failed for DEFAULT_NAMESPACE & Pod: #{podname}" unless @group_watchers[DEFAULT_NAMESPACE][podname].limit >= 0
+        raise "Group line limit resolution failed" unless @group_watchers[DEFAULT_NAMESPACE][podname].limit >= 0
       }
     end
 
@@ -252,6 +252,7 @@ module Fluent::Plugin
 
                     if group_watcher.limit_lines_reached?(@path) || should_shutdown_now?
                       # Just get out from tailing loop.
+                      @log.warn "Read limit exceeded" if !should_shutdown_now? 
                       read_more = false
                       break
                     elsif @lines.size >= @read_lines_limit
@@ -264,6 +265,7 @@ module Fluent::Plugin
                   @eof = true
                 end
               end
+              @log.debug "Lines read: #{@path} #{group_watcher.current_paths[@path].number_lines_read}"
 
               if !group_watcher.limit_time_period_reached?(@path)
                 # reset counter for files in same group
@@ -284,7 +286,7 @@ module Fluent::Plugin
         end
 
         def handle_notify
-          if @watcher.group_watcher.nil?
+          if group_watcher.nil?
             orig_handle_notify
           else
             rate_limit_handle_notify
